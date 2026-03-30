@@ -45,40 +45,69 @@ is_skipped() {
 
 # --- Xcode projects ---
 
-# Find .xcodeproj at root or one level deep
-XCODE_PROJECTS=$(find "$ROOT" -maxdepth 2 -name "*.xcodeproj" -not -path "*/.*" 2>/dev/null)
+# Cache simulator ID (looked up once, reused for all iOS targets)
+IOS_SIM_ID=""
 
-for PROJ in $XCODE_PROJECTS; do
+# Find .xcodeproj at root or one level deep (handle spaces in paths)
+while IFS= read -r -d '' PROJ; do
   PROJ_DIR=$(dirname "$PROJ")
   PROJ_NAME=$(basename "$PROJ")
   cd "$PROJ_DIR" || continue
 
-  # Discover schemes
-  SCHEMES=$(xcodebuild -list -project "$PROJ_NAME" 2>/dev/null | sed -n '/Schemes:/,/^$/p' | grep -v "Schemes:" | sed 's/^[[:space:]]*//' | grep -v '^$')
+  # Discover test targets (not schemes — test targets live under app schemes)
+  TARGETS=$(xcodebuild -list -project "$PROJ_NAME" 2>/dev/null \
+    | sed -n '/Targets:/,/^$/p' | grep -v "Targets:" | sed 's/^[[:space:]]*//' | grep -v '^$')
 
-  for SCHEME in $SCHEMES; do
-    # Only process app schemes that have test targets, or test-only schemes
-    if [[ "$SCHEME" != *"Tests"* && "$SCHEME" != *"Test"* ]]; then
-      # This is an app scheme — check if it has test targets by trying -showTestPlans
-      HAS_TESTS=$(xcodebuild -showTestPlans -scheme "$SCHEME" -project "$PROJ_NAME" 2>&1 | grep -c "Test plans" || true)
-      if [[ "$HAS_TESTS" -eq 0 ]]; then
-        continue
-      fi
-    fi
+  # Filter to test targets only
+  TEST_TARGETS=$(echo "$TARGETS" | grep -i "test" || true)
+  if [[ -z "$TEST_TARGETS" ]]; then
+    continue
+  fi
 
-    # Skip XCUITest targets unless opted in
-    if [[ "$SCHEME" == *"UI Tests"* || "$SCHEME" == *"UITests"* ]]; then
+  # Discover available schemes
+  SCHEMES=$(xcodebuild -list -project "$PROJ_NAME" 2>/dev/null \
+    | sed -n '/Schemes:/,/^$/p' | grep -v "Schemes:" | sed 's/^[[:space:]]*//' | grep -v '^$')
+
+  while IFS= read -r TARGET; do
+    [[ -z "$TARGET" ]] && continue
+
+    # Skip UI test targets unless opted in
+    if [[ "$TARGET" == *"UI Tests"* || "$TARGET" == *"UITests"* ]]; then
       if [[ "$XCUITESTS" != "true" ]]; then
         continue
       fi
     fi
 
     # Check skip list
-    if is_skipped "$SCHEME"; then
+    if is_skipped "$TARGET"; then
       continue
     fi
 
-    # Determine platform from build settings
+    # Find the app scheme that can run this test target.
+    # Convention: "Seneca macOS Tests" → scheme "Seneca macOS"
+    #             "Seneca iOS UI Tests" → scheme "Seneca iOS"
+    SCHEME=""
+    # Strip common test suffixes to derive the app scheme name
+    CANDIDATE=$(echo "$TARGET" | sed -E 's/ *(UI )?Tests$//')
+    if echo "$SCHEMES" | grep -qx "$CANDIDATE"; then
+      SCHEME="$CANDIDATE"
+    else
+      # Fallback: try each scheme and see if this target is buildable under it
+      while IFS= read -r S; do
+        [[ -z "$S" ]] && continue
+        if xcodebuild -showBuildSettings -scheme "$S" -target "$TARGET" -project "$PROJ_NAME" >/dev/null 2>&1; then
+          SCHEME="$S"
+          break
+        fi
+      done <<< "$SCHEMES"
+    fi
+
+    if [[ -z "$SCHEME" ]]; then
+      # Can't find a scheme for this test target — skip
+      continue
+    fi
+
+    # Determine platform from the scheme's build settings
     PLATFORMS=$(xcodebuild -showBuildSettings -scheme "$SCHEME" -project "$PROJ_NAME" 2>/dev/null \
       | grep "SUPPORTED_PLATFORMS" | head -1 | awk '{print $3}')
 
@@ -86,9 +115,10 @@ for PROJ in $XCODE_PROJECTS; do
     if [[ "$PLATFORMS" == *"macos"* ]]; then
       DESTINATION="platform=macOS"
     elif [[ "$PLATFORMS" == *"iphone"* ]]; then
-      # Pick first available iPhone simulator
-      SIM_ID=$(xcrun simctl list devices available -j 2>/dev/null \
-        | python3 -c "
+      # Look up simulator once, cache for reuse
+      if [[ -z "$IOS_SIM_ID" ]]; then
+        IOS_SIM_ID=$(xcrun simctl list devices available -j 2>/dev/null \
+          | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for runtime, devices in data.get('devices', {}).items():
@@ -99,47 +129,34 @@ for runtime, devices in data.get('devices', {}).items():
             print(d['udid'])
             sys.exit(0)
 " 2>/dev/null || echo "")
-      if [[ -z "$SIM_ID" ]]; then
-        FAILURES="${FAILURES}Could not find iOS simulator for $SCHEME. "
+      fi
+      if [[ -z "$IOS_SIM_ID" ]]; then
+        FAILURES="${FAILURES}Could not find iOS simulator for $TARGET. "
         continue
       fi
-      DESTINATION="platform=iOS Simulator,id=$SIM_ID"
+      DESTINATION="platform=iOS Simulator,id=$IOS_SIM_ID"
     else
-      # Unknown platform, try macOS as fallback
       DESTINATION="platform=macOS"
     fi
 
-    # Determine which test bundle to run
-    # For app schemes (e.g. "Seneca macOS"), restrict to unit tests only
-    ONLY_TESTING=""
-    if [[ "$SCHEME" != *"Tests"* && "$SCHEME" != *"Test"* ]]; then
-      # App scheme — find the unit test target name (not UI tests)
-      UNIT_TARGET=$(xcodebuild -list -project "$PROJ_NAME" 2>/dev/null \
-        | sed -n '/Targets:/,/^$/p' | grep -i "test" | grep -vi "ui test" \
-        | sed 's/^[[:space:]]*//' | head -1)
-      if [[ -n "$UNIT_TARGET" ]]; then
-        ONLY_TESTING="-only-testing:$UNIT_TARGET"
-      fi
-    fi
-
-    # Run tests
+    # Run tests for this specific test target under its app scheme
     RESULT=$(xcodebuild test \
       -project "$PROJ_NAME" \
       -scheme "$SCHEME" \
       -destination "$DESTINATION" \
-      $ONLY_TESTING \
+      -only-testing:"$TARGET" \
       2>&1 | grep "Executed" | tail -1)
 
-    LABEL="$SCHEME tests ($PROJ_NAME)"
+    LABEL="$TARGET ($PROJ_NAME)"
     if echo "$RESULT" | grep -q "with 0 failures"; then
       PASSED="${PASSED}${LABEL} passed. "
     else
       FAILURES="${FAILURES}${LABEL} failed. "
     fi
-  done
+  done <<< "$TEST_TARGETS"
 
   cd "$ROOT" || true
-done
+done < <(find "$ROOT" -maxdepth 2 -name "*.xcodeproj" -not -path "*/.*" -print0 2>/dev/null)
 
 # --- Python projects ---
 
