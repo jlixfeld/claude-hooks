@@ -140,6 +140,8 @@ for runtime, devices in data.get('devices', {}).items():
     fi
 
     # Run tests for this specific test target under its app scheme
+    LABEL="$TARGET ($PROJ_NAME)"
+    echo "⏳ Running $LABEL ..." >&2
     RESULT=$(xcodebuild test \
       -project "$PROJ_NAME" \
       -scheme "$SCHEME" \
@@ -147,10 +149,11 @@ for runtime, devices in data.get('devices', {}).items():
       -only-testing:"$TARGET" \
       2>&1 | grep "Executed" | tail -1)
 
-    LABEL="$TARGET ($PROJ_NAME)"
     if echo "$RESULT" | grep -q "with 0 failures"; then
+      echo "✅ $LABEL passed" >&2
       PASSED="${PASSED}${LABEL} passed. "
     else
+      echo "❌ $LABEL failed" >&2
       FAILURES="${FAILURES}${LABEL} failed. "
     fi
   done <<< "$TEST_TARGETS"
@@ -162,10 +165,13 @@ done < <(find "$ROOT" -maxdepth 2 -name "*.xcodeproj" -not -path "*/.*" -print0 
 
 if [[ -f "$ROOT/pyproject.toml" ]]; then
   cd "$ROOT"
+  echo "⏳ Running pytest ..." >&2
   RESULT=$(uv run pytest --tb=short -q 2>&1 | tail -5)
   if echo "$RESULT" | grep -qE "passed|no tests ran" && ! echo "$RESULT" | grep -q "failed"; then
+    echo "✅ pytest passed" >&2
     PASSED="${PASSED}pytest passed. "
   else
+    echo "❌ pytest failed" >&2
     FAILURES="${FAILURES}pytest failed. "
   fi
 fi
@@ -177,9 +183,12 @@ for i in $(seq 0 $((EXTRA_COUNT - 1))); do
   CMD=$(echo "$EXTRA_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)[$i])" 2>/dev/null || echo "")
   if [[ -n "$CMD" ]]; then
     cd "$ROOT"
+    echo "⏳ Running $CMD ..." >&2
     if eval "$CMD" >/dev/null 2>&1; then
+      echo "✅ $CMD passed" >&2
       PASSED="${PASSED}$CMD passed. "
     else
+      echo "❌ $CMD failed" >&2
       FAILURES="${FAILURES}$CMD failed. "
     fi
   fi
